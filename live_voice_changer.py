@@ -1,13 +1,21 @@
 """
-Live DSP Voice Changer (Python desktop)
-Features:
-- Live microphone input and speaker/headphone output
-- Current age/gender and target age/voice-style controls
-- Pitch shift (real-time FFT-bin remapping; prototype quality)
-- Timbre/EQ shaping
-- Simple noise gate
-- Echo, robotic ring-modulation, telephone/radio filter
-- Optional recording to WAV
+Live DSP Voice Changer  (v2 - rewritten pitch engine)
+
+What's new compared with v1
+---------------------------
+* Real phase-vocoder pitch shifter with peak phase-locking (no more metallic
+  "FFT bin remapping" sound).
+* INDEPENDENT pitch and formant control. Formants (vocal-tract resonances) are
+  what make a voice sound male / female / child / old. Pitch alone sounds like
+  a chipmunk or a monster; pitch + formants sounds like a different person.
+* Age / gender presets are computed from approximate real-world f0 and
+  vocal-tract-length values instead of arbitrary offsets.
+* All filters keep their state between audio blocks (v1 rebuilt them every
+  block, which caused clicks and buzzing).
+* Smooth noise gate, continuous ring-mod phase, vectorised echo (v1 used a
+  Python loop per sample), soft limiter instead of tanh distortion.
+* Audio device selection and automatic sample-rate fallback.
+* Fixed the slider value labels, which were always blank in v1.
 
 Install:
     python -m pip install numpy scipy sounddevice soundfile
@@ -15,73 +23,231 @@ Install:
 Run:
     python live_voice_changer.py
 
-Safety: speaker output can feed back into the microphone. Start at low volume.
-Headphones are strongly recommended for a clean demo.
+USE HEADPHONES. Speaker output feeds back into the microphone.
 """
 
-import threading
+import math
 import queue
-import time
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
 from scipy.signal import butter, sosfilt
 
+try:
+    import sounddevice as sd
+    SD_ERROR = None
+except Exception as exc:  # PortAudio missing, etc.
+    sd = None
+    SD_ERROR = exc
 
-SAMPLE_RATE = 44100
-CHANNELS = 1
-BLOCK_SIZE = 512
-FFT_SIZE = 2048
+try:
+    import soundfile as sf
+except Exception:
+    sf = None
+
+
+FFT_SIZE = 2048      # analysis window. Needs to be big enough to resolve voice harmonics.
+HOP = 512            # also the audio block size (75 % overlap)
+TWO_PI = 2.0 * np.pi
 
 
 def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-class LiveDSP:
-    """Lightweight real-time DSP processor. Intended as a student project prototype."""
+# --------------------------------------------------------------------------- #
+#  Pitch + formant shifter (phase vocoder with peak phase locking)
+# --------------------------------------------------------------------------- #
+class PitchFormantShifter:
+    """
+    Streaming STFT pitch shifter.
 
-    def __init__(self, sample_rate, channels=1, block_size=512, fft_size=2048):
+    1. Split the spectrum into  envelope (formants)  x  excitation (harmonics)
+       using cepstral smoothing.
+    2. Shift the excitation by `pitch` semitones using a phase vocoder where
+       every spectral peak keeps its own coherent phase and its neighbouring
+       bins keep their phase relation to that peak (Laroche & Dolson 1999).
+       This is what removes the metallic / phasey artefacts.
+    3. Re-apply the envelope, shifted by `formant` semitones.
+    """
+
+    def __init__(self, sample_rate, fft_size=FFT_SIZE, hop=HOP):
         self.sr = sample_rate
-        self.channels = channels
-        self.block_size = block_size
-        self.fft_size = fft_size
-        self.hop = block_size
-        self.window = np.hanning(fft_size).astype(np.float32)
-        self.freq_axis = np.arange(fft_size // 2 + 1, dtype=np.float32)
-        self.input_history = np.zeros((fft_size, channels), dtype=np.float32)
-        self.output_overlap = np.zeros((fft_size, channels), dtype=np.float32)
-        self.norm_overlap = np.zeros(fft_size, dtype=np.float32)
-        self.window_sq = self.window * self.window
+        self.N = fft_size
+        self.H = hop
+        self.bins = fft_size // 2 + 1
+        self.window = 0.5 - 0.5 * np.cos(TWO_PI * np.arange(fft_size) / fft_size)
+        self.out_scale = hop / np.sum(self.window ** 2)  # overlap-add gain compensation
+        self.kf = np.arange(self.bins, dtype=np.float64)
+        self.ki = np.arange(self.bins)
+        self.expected = TWO_PI * hop * self.kf / fft_size
+        self.lifter = max(20, int(0.0018 * sample_rate))  # ~1.8 ms: below any voice pitch period
+        freqs = self.kf * sample_rate / fft_size
+        self.log2f = np.log2(np.maximum(freqs, 60.0) / 1000.0)
+        self.reset()
 
-        self.delay_samples = int(sample_rate * 0.28)
-        self.delay_line = np.zeros((self.delay_samples + block_size + 1, channels), dtype=np.float32)
-        self.delay_pos = 0
+    def reset(self):
+        self.in_buf = np.zeros(self.N)
+        self.out_acc = np.zeros(self.N)
+        self.last_phase = np.zeros(self.bins)
+        self.prev_peaks = np.zeros(0, dtype=int)
+        self.prev_syn = np.zeros(0)
+
+    @staticmethod
+    def _nearest(sorted_vals, query):
+        """Index into sorted_vals of the nearest value, for each query."""
+        j = np.searchsorted(sorted_vals, query)
+        jl = np.clip(j - 1, 0, len(sorted_vals) - 1)
+        jr = np.clip(j, 0, len(sorted_vals) - 1)
+        use_left = np.abs(query - sorted_vals[jl]) <= np.abs(sorted_vals[jr] - query)
+        return np.where(use_left, jl, jr)
+
+    def process_hop(self, hop_in, pitch_semi, formant_semi, tilt_db_oct):
+        N, H = self.N, self.H
+        self.in_buf[:-H] = self.in_buf[H:]
+        self.in_buf[-H:] = hop_in
+
+        # zero-phase framing (fftshift) so bin phases inside a peak are consistent
+        spec = np.fft.rfft(np.fft.fftshift(self.in_buf * self.window))
+        mag = np.abs(spec)
+        phase = np.angle(spec)
+
+        if mag.max() < 1e-6:  # silence: nothing to track
+            self.last_phase[:] = 0.0
+            self.prev_peaks = np.zeros(0, dtype=int)
+            frame = np.zeros(N)
+        else:
+            # --- true instantaneous frequency of every bin (in bins) ---
+            d = phase - self.last_phase - self.expected
+            self.last_phase = phase
+            d -= TWO_PI * np.round(d / TWO_PI)
+            true_bin = self.kf + d * N / (TWO_PI * H)
+
+            # --- spectral envelope (formants) via cepstral liftering ---
+            cep = np.fft.irfft(np.log(mag + 1e-9), n=N)
+            cep[self.lifter + 1:N - self.lifter] = 0.0
+            env = np.exp(np.fft.rfft(cep).real)
+            flat = mag / env  # excitation / harmonics only
+
+            # --- peaks of the excitation ---
+            inner = flat[2:-2]
+            is_peak = ((inner > flat[:-4]) & (inner > flat[1:-3]) &
+                       (inner >= flat[3:-1]) & (inner >= flat[4:]))
+            peaks = np.nonzero(is_peak)[0] + 2
+            if peaks.size == 0:
+                peaks = np.array([int(np.argmax(flat))])
+            region_peak = peaks[self._nearest(peaks, self.ki)]  # peak that "owns" each bin
+
+            # --- phase accumulation per peak (tracked frame to frame) ---
+            factor = 2.0 ** (pitch_semi / 12.0)
+            advance = TWO_PI * H / N * true_bin[peaks] * factor
+            if self.prev_peaks.size:
+                jj = self._nearest(self.prev_peaks, peaks)
+                matched = np.abs(self.prev_peaks[jj] - peaks) <= 2
+                syn_p = np.where(matched, self.prev_syn[jj] + advance, phase[peaks])
+            else:
+                syn_p = phase[peaks].copy()
+            syn_p = (syn_p + np.pi) % TWO_PI - np.pi
+            self.prev_peaks, self.prev_syn = peaks, syn_p
+
+            syn_by_bin = np.zeros(self.bins)
+            syn_by_bin[peaks] = syn_p
+
+            # --- build shifted spectrum: target bin j <- source bin j / factor ---
+            src_pos = self.kf / factor
+            valid = src_pos <= self.bins - 1
+            src = np.minimum(np.rint(src_pos).astype(int), self.bins - 1)
+            pk = region_peak[src]
+            new_phase = syn_by_bin[pk] + (phase[src] - phase[pk])
+            new_mag = np.interp(src_pos, self.kf, flat) * valid
+
+            # --- apply (possibly shifted) formant envelope + brightness tilt ---
+            ff = 2.0 ** (formant_semi / 12.0)
+            env_s = np.interp(self.kf / ff, self.kf, env)
+            gain = env_s
+            if abs(tilt_db_oct) > 0.01:
+                gain = gain * 10.0 ** (np.clip(tilt_db_oct * self.log2f, -18, 18) / 20.0)
+
+            out_spec = new_mag * gain * np.exp(1j * new_phase)
+            frame = np.fft.fftshift(np.fft.irfft(out_spec, n=N)) * self.window * self.out_scale
+
+        self.out_acc += frame
+        out = self.out_acc[:H].copy()
+        self.out_acc[:-H] = self.out_acc[H:]
+        self.out_acc[-H:] = 0.0
+        return out.astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
+#  Voice presets from age / gender
+# --------------------------------------------------------------------------- #
+def voice_traits(age, gender):
+    """Approximate (mean f0 in Hz, formant scale vs adult male, tremor 0-1)."""
+    male, female = (120.0, 1.00), (210.0, 1.17)
+    if gender == "Male":
+        adult = male
+    elif gender == "Female":
+        adult = female
+    else:
+        adult = (math.sqrt(male[0] * female[0]), math.sqrt(male[1] * female[1]))
+
+    if age <= 12:
+        t = clamp((age - 4) / 8.0, 0, 1)
+        f0, fs = 300.0 - 50.0 * t, 1.38 - 0.13 * t
+    elif age < 18:  # blend child -> adult through puberty
+        t = (age - 12) / 6.0
+        f0 = (1 - t) * 250.0 + t * adult[0]
+        fs = (1 - t) * 1.25 + t * adult[1]
+    else:
+        f0, fs = adult
+    tremor = 0.0
+    if age >= 60:
+        t = clamp((age - 60) / 15.0, 0, 1)
+        if gender == "Male":
+            f0 *= 1 + 0.12 * t
+        elif gender == "Female":
+            f0 *= 1 - 0.12 * t
+        fs *= 1 - 0.03 * t
+        tremor = 0.6 * t
+    return f0, fs, tremor
+
+
+# --------------------------------------------------------------------------- #
+#  Full effect chain
+# --------------------------------------------------------------------------- #
+class LiveDSP:
+    def __init__(self, sample_rate):
+        self.sr = sample_rate
+        self.shifter = PitchFormantShifter(sample_rate)
+        self.in_fifo = np.zeros(0, dtype=np.float32)
+        self.out_fifo = np.zeros(0, dtype=np.float32)
 
         self.settings_lock = threading.Lock()
-        self.settings = {
-            "pitch": 0.0,
-            "timbre": 0.4,
-            "noise_gate": 0.0,
-            "echo": 0.0,
-            "robot": 0.0,
-            "radio": False,
-            "profile": "Neutral",
-        }
+        self.settings = dict(pitch=0.0, formant=0.0, brightness=0.0, gate_db=-80.0,
+                             echo=0.0, robot=0.0, tremor=0.0, radio=False, volume=0.8)
 
-        self.hp_sos = butter(2, 100, btype="highpass", fs=sample_rate, output="sos")
-        self.lp_sos = butter(2, min(7000, sample_rate * 0.4), btype="lowpass", fs=sample_rate, output="sos")
-        self.hp_zi = np.zeros((self.hp_sos.shape[0], 2, channels), dtype=np.float32)
-        self.lp_zi = np.zeros((self.lp_sos.shape[0], 2, channels), dtype=np.float32)
+        # stateful filters (state is carried across blocks -> no clicks)
+        self.hp_sos = butter(2, 80, btype="highpass", fs=sample_rate, output="sos")
+        self.hp_zi = np.zeros((self.hp_sos.shape[0], 2))
+        self.bp_sos = butter(3, [300, min(3400, 0.45 * sample_rate)], btype="bandpass",
+                             fs=sample_rate, output="sos")
+        self.bp_zi = np.zeros((self.bp_sos.shape[0], 2))
 
-        self.noise_floor = 0.003
+        self.gate_gain = 1.0
+        self.gate_hold = 0
+        self.delay_samples = int(sample_rate * 0.28)
+        self.delay_line = np.zeros(self.delay_samples + 16384, dtype=np.float32)
+        self.delay_pos = 0
+        self.rm_phase = 0.0
+        self.trem_phase = 0.0
+
         self.recording_lock = threading.Lock()
         self.recording = False
         self.recorded_chunks = []
 
+    # -- settings -------------------------------------------------------- #
     def update_settings(self, **kwargs):
         with self.settings_lock:
             self.settings.update(kwargs)
@@ -90,193 +256,210 @@ class LiveDSP:
         with self.settings_lock:
             return dict(self.settings)
 
-    def _pitch_shift_frame(self, frame, semitones):
-        if abs(semitones) < 0.05:
-            return frame
-        factor = 2.0 ** (semitones / 12.0)
-        spectrum = np.fft.rfft(frame * self.window[:, None], axis=0)
-        source_positions = self.freq_axis / factor
-        shifted = np.empty_like(spectrum)
-        for ch in range(self.channels):
-            shifted[:, ch] = (
-                np.interp(source_positions, self.freq_axis, spectrum[:, ch].real, left=0.0, right=0.0)
-                + 1j * np.interp(source_positions, self.freq_axis, spectrum[:, ch].imag, left=0.0, right=0.0)
-            )
-        shifted_frame = np.fft.irfft(shifted, n=self.fft_size, axis=0).astype(np.float32)
-        return shifted_frame * self.window[:, None]
-
-    def _timbre_shape(self, x, profile, strength):
-        if strength <= 0.001 or profile == "Neutral":
+    # -- stages ---------------------------------------------------------- #
+    def _noise_gate(self, x, thr_db):
+        if thr_db <= -79:
+            self.gate_gain = 1.0
             return x
-        # Broad EQ bands approximate tone colour; this is not independent formant shifting.
-        cutoff = {
-            "Bright / child-like": 1800,
-            "Feminine-style": 1500,
-            "Masculine-style": 950,
-            "Elderly-style": 2400,
-        }.get(profile, 1400)
-        cutoff = clamp(cutoff, 150, self.sr * 0.42)
-        sos_low = butter(2, cutoff, btype="lowpass", fs=self.sr, output="sos")
-        sos_high = butter(2, cutoff, btype="highpass", fs=self.sr, output="sos")
-        low = sosfilt(sos_low, x, axis=0)
-        high = sosfilt(sos_high, x, axis=0)
-        if profile == "Bright / child-like":
-            result = low * (1.0 - 0.25 * strength) + high * (1.0 + 0.55 * strength)
-        elif profile == "Feminine-style":
-            result = low * (1.0 - 0.15 * strength) + high * (1.0 + 0.35 * strength)
-        elif profile == "Masculine-style":
-            result = low * (1.0 + 0.35 * strength) + high * (1.0 - 0.15 * strength)
-        else:  # elderly-style
-            result = low * (1.0 - 0.08 * strength) + high * (1.0 - 0.25 * strength)
-        return result.astype(np.float32)
+        n = len(x)
+        level_db = 20 * math.log10(float(np.sqrt(np.mean(x * x))) + 1e-9)
+        if level_db > thr_db:
+            self.gate_hold = int(0.15 * self.sr)  # hold open 150 ms to avoid chatter
+        target = 1.0 if self.gate_hold > 0 else 0.0
+        self.gate_hold = max(0, self.gate_hold - n)
+        tau = 0.005 if target > self.gate_gain else 0.08
+        new_gain = self.gate_gain + (target - self.gate_gain) * (1 - math.exp(-n / (tau * self.sr)))
+        ramp = np.linspace(self.gate_gain, new_gain, n, endpoint=False, dtype=np.float32)
+        self.gate_gain = new_gain
+        return x * ramp
 
-    def _process_block(self, input_block):
-        settings = self.get_settings()
-        x = np.asarray(input_block, dtype=np.float32).copy()
-        if x.ndim == 1:
-            x = x[:, None]
+    def process(self, block):
+        s = self.get_settings()
+        x = np.asarray(block, dtype=np.float32).reshape(-1)
+        n = len(x)
 
-        # Simple noise gate: attenuates quiet blocks; it is not a studio-grade denoiser.
-        gate_strength = float(settings["noise_gate"])
-        rms = float(np.sqrt(np.mean(x * x) + 1e-12))
-        self.noise_floor = 0.995 * self.noise_floor + 0.005 * min(rms, self.noise_floor * 3 + 0.0005)
-        threshold = self.noise_floor * (1.0 + 18.0 * gate_strength)
-        if gate_strength > 0 and rms < threshold:
-            x *= max(0.08, rms / (threshold + 1e-8))
+        x, self.hp_zi = sosfilt(self.hp_sos, x, zi=self.hp_zi)  # remove rumble / DC
+        x = self._noise_gate(x.astype(np.float32), s["gate_db"])
 
-        # Telephone/radio bandwidth limitation.
-        if settings["radio"]:
-            x, self.hp_zi = sosfilt(self.hp_sos, x, axis=0, zi=self.hp_zi)
-            x, self.lp_zi = sosfilt(self.lp_sos, x, axis=0, zi=self.lp_zi)
+        # --- pitch / formant (hop by hop) ---
+        self.in_fifo = np.concatenate((self.in_fifo, x))
+        produced = []
+        while len(self.in_fifo) >= HOP:
+            hop, self.in_fifo = self.in_fifo[:HOP], self.in_fifo[HOP:]
+            semis = s["pitch"] + 0.35 * s["tremor"] * math.sin(self.trem_phase)  # aged-voice wobble
+            self.trem_phase = (self.trem_phase + TWO_PI * 5.5 * HOP / self.sr) % TWO_PI
+            produced.append(self.shifter.process_hop(hop, semis, s["formant"], s["brightness"]))
+        if produced:
+            self.out_fifo = np.concatenate([self.out_fifo] + produced)
 
-        # FFT frame-based pitch transform with overlap-add. This is a lightweight demo
-        # and may sound more metallic than a professional phase-vocoder pitch shifter.
-        self.input_history = np.concatenate((self.input_history, x), axis=0)[-self.fft_size:]
-        frame_out = self._pitch_shift_frame(self.input_history, float(settings["pitch"]))
-        self.output_overlap += frame_out
-        self.norm_overlap += self.window_sq
-        out = self.output_overlap[:self.hop].copy()
-        norm = np.maximum(self.norm_overlap[:self.hop], 0.08)
-        out /= norm[:, None]
-        self.output_overlap = np.concatenate(
-            (self.output_overlap[self.hop:], np.zeros((self.hop, self.channels), dtype=np.float32)), axis=0
-        )
-        self.norm_overlap = np.concatenate(
-            (self.norm_overlap[self.hop:], np.zeros(self.hop, dtype=np.float32)), axis=0
-        )
+        if len(self.out_fifo) >= n:
+            out, self.out_fifo = self.out_fifo[:n], self.out_fifo[n:]
+        else:  # underrun (only if the device block size isn't a multiple of HOP)
+            out = np.zeros(n, dtype=np.float32)
+            out[n - len(self.out_fifo):] = self.out_fifo
+            self.out_fifo = np.zeros(0, dtype=np.float32)
+        out = out.astype(np.float32)
 
-        out = self._timbre_shape(out, settings["profile"], float(settings["timbre"]))
+        if s["tremor"] > 0.001:  # amplitude wobble
+            ph = self.trem_phase + TWO_PI * 5.5 * np.arange(n) / self.sr
+            out *= (1.0 - 0.18 * s["tremor"] * (0.5 - 0.5 * np.cos(ph))).astype(np.float32)
 
-        # Echo via a delay line.
-        echo = float(settings["echo"])
-        if echo > 0:
-            delayed = np.zeros_like(out)
-            for i in range(len(out)):
-                read_pos = (self.delay_pos - self.delay_samples) % len(self.delay_line)
-                delayed[i] = self.delay_line[read_pos]
-                self.delay_line[self.delay_pos] = out[i] + delayed[i] * 0.25
-                self.delay_pos = (self.delay_pos + 1) % len(self.delay_line)
-            out = out + echo * delayed
+        if s["radio"]:
+            out, self.bp_zi = sosfilt(self.bp_sos, out, zi=self.bp_zi)
+            out = (out * 1.6).astype(np.float32)
+
+        # echo (vectorised; delay is longer than a block so reads never hit fresh writes)
+        L, D = len(self.delay_line), self.delay_samples
+        idx = (self.delay_pos + np.arange(n)) % L
+        if s["echo"] > 0.001:
+            delayed = self.delay_line[(idx - D) % L]
+            self.delay_line[idx] = out + 0.35 * delayed
+            out = out + s["echo"] * delayed
         else:
-            for i in range(len(out)):
-                self.delay_line[self.delay_pos] = out[i]
-                self.delay_pos = (self.delay_pos + 1) % len(self.delay_line)
+            self.delay_line[idx] = out
+        self.delay_pos = (self.delay_pos + n) % L
 
-        # Robotic ring modulation.
-        robot = float(settings["robot"])
-        if robot > 0:
-            start_time = time.perf_counter()
-            t = (np.arange(len(out), dtype=np.float32) + start_time * self.sr) / self.sr
-            carrier = np.sin(2 * np.pi * 45.0 * t)[:, None]
-            out = (1.0 - robot) * out + robot * out * carrier
+        if s["robot"] > 0.001:  # ring modulation with continuous phase
+            ph = self.rm_phase + TWO_PI * 50.0 * np.arange(n) / self.sr
+            out = (1 - s["robot"]) * out + s["robot"] * out * np.sin(ph).astype(np.float32)
+            self.rm_phase = (self.rm_phase + TWO_PI * 50.0 * n / self.sr) % TWO_PI
 
-        # Soft limiter and output gain.
-        out = np.tanh(out * 1.3) * 0.85
+        out = out * s["volume"]
+        # soft limiter: transparent below 0.8, smooth saturation above
+        a = np.abs(out)
+        over = a > 0.8
+        if np.any(over):
+            out[over] = np.sign(out[over]) * (0.8 + 0.19 * np.tanh((a[over] - 0.8) / 0.19))
+        out = out.astype(np.float32)
 
         with self.recording_lock:
             if self.recording:
                 self.recorded_chunks.append(out.copy())
+        return out
 
-        return out.astype(np.float32)
+
+# --------------------------------------------------------------------------- #
+#  GUI
+# --------------------------------------------------------------------------- #
+def list_devices(kind):
+    """kind = 'input' or 'output' -> ['3: Microphone (USB)', ...]"""
+    if sd is None:
+        return []
+    try:
+        return [f"{i}: {d['name']}" for i, d in enumerate(sd.query_devices())
+                if d[f"max_{kind}_channels"] > 0]
+    except Exception:
+        return []
+
+
+def default_device(kind, items):
+    try:
+        idx = sd.default.device[0 if kind == "input" else 1]
+        for item in items:
+            if item.startswith(f"{idx}:"):
+                return item
+    except Exception:
+        pass
+    return items[0] if items else ""
 
 
 class VoiceChangerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Live DSP Voice Changer")
-        self.root.geometry("850x760")
-        self.root.minsize(760, 680)
+        self.root.geometry("880x860")
+        self.root.minsize(780, 760)
 
-        self.processor = LiveDSP(SAMPLE_RATE, CHANNELS, BLOCK_SIZE, FFT_SIZE)
+        self.processor = None
         self.stream = None
+        self.sample_rate = 44100
         self.running = False
         self.audio_errors = queue.Queue()
-        self.status = tk.StringVar(value="Stopped — configure your voice, then click Start")
+        self.status = tk.StringVar(value="Stopped. Pick your voices, then click Start (headphones recommended).")
+
         self.current_age = tk.IntVar(value=25)
         self.current_gender = tk.StringVar(value="Male")
-        self.target_age = tk.IntVar(value=60)
+        self.target_age = tk.IntVar(value=25)
         self.target_gender = tk.StringVar(value="Female")
-        self.profile = tk.StringVar(value="Elderly-style")
-        self.pitch = tk.DoubleVar(value=-2.0)
-        self.timbre = tk.DoubleVar(value=0.5)
-        self.noise_gate = tk.DoubleVar(value=0.2)
+        self.pitch = tk.DoubleVar(value=0.0)
+        self.formant = tk.DoubleVar(value=0.0)
+        self.brightness = tk.DoubleVar(value=0.0)
+        self.gate_db = tk.DoubleVar(value=-80.0)
         self.echo = tk.DoubleVar(value=0.0)
         self.robot = tk.DoubleVar(value=0.0)
+        self.tremor = tk.DoubleVar(value=0.0)
+        self.volume = tk.DoubleVar(value=0.8)
         self.radio = tk.BooleanVar(value=False)
 
+        self.in_devices = list_devices("input")
+        self.out_devices = list_devices("output")
+        self.in_dev = tk.StringVar(value=default_device("input", self.in_devices))
+        self.out_dev = tk.StringVar(value=default_device("output", self.out_devices))
+
         self._build_ui()
+        self.suggest_settings(announce=False)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(200, self.check_errors)
 
+    # -- UI -------------------------------------------------------------- #
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=12)
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="Live Age & Gender-Inspired DSP Voice Changer",
+        ttk.Label(main, text="Live Age & Gender Voice Changer",
                   font=("Segoe UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(main, text="Live microphone → DSP effects → speakers/headphones",
+        ttk.Label(main, text="Microphone → pitch + formant engine → effects → headphones",
                   font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 8))
+        ttk.Label(main, wraplength=820, foreground="#9a4d00",
+                  text="Use headphones. Speakers feed the processed voice back into the mic and cause howling.").pack(anchor="w", pady=(0, 8))
 
-        warning = ("Important: speakers can feed your processed voice back into the microphone and cause loud howling. "
-                   "Start with low volume; headphones are recommended.")
-        ttk.Label(main, text=warning, wraplength=800, foreground="#9a4d00").pack(anchor="w", pady=(0, 10))
+        dev = ttk.LabelFrame(main, text="Audio devices", padding=10)
+        dev.pack(fill="x", pady=4)
+        dev.columnconfigure(1, weight=1)
+        ttk.Label(dev, text="Microphone").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Combobox(dev, textvariable=self.in_dev, values=self.in_devices, state="readonly").grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Label(dev, text="Headphones / output").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Combobox(dev, textvariable=self.out_dev, values=self.out_devices, state="readonly").grid(row=1, column=1, sticky="ew", padx=8)
 
-        details = ttk.LabelFrame(main, text="1. Person and target voice", padding=10)
+        details = ttk.LabelFrame(main, text="1. Who you are → who you want to sound like", padding=10)
         details.pack(fill="x", pady=4)
         for col in range(4):
             details.columnconfigure(col, weight=1)
-        ttk.Label(details, text="Current age").grid(row=0, column=0, sticky="w")
-        ttk.Spinbox(details, from_=1, to=120, textvariable=self.current_age, width=8).grid(row=1, column=0, sticky="w", padx=(0, 8))
-        ttk.Label(details, text="Current gender").grid(row=0, column=1, sticky="w")
-        ttk.Combobox(details, textvariable=self.current_gender, values=["Female", "Male", "Non-binary / prefer not to say"], state="readonly", width=24).grid(row=1, column=1, sticky="w", padx=(0, 8))
+        ttk.Label(details, text="Your age").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(details, from_=1, to=100, textvariable=self.current_age, width=8).grid(row=1, column=0, sticky="w")
+        ttk.Label(details, text="Your voice").grid(row=0, column=1, sticky="w")
+        ttk.Combobox(details, textvariable=self.current_gender, values=["Female", "Male", "Neutral"],
+                     state="readonly", width=14).grid(row=1, column=1, sticky="w")
         ttk.Label(details, text="Target age").grid(row=0, column=2, sticky="w")
-        ttk.Spinbox(details, from_=1, to=120, textvariable=self.target_age, width=8).grid(row=1, column=2, sticky="w", padx=(0, 8))
-        ttk.Label(details, text="Target voice style").grid(row=0, column=3, sticky="w")
-        ttk.Combobox(details, textvariable=self.target_gender, values=["Female", "Male", "Neutral / androgynous"], state="readonly", width=22).grid(row=1, column=3, sticky="w")
+        ttk.Spinbox(details, from_=1, to=100, textvariable=self.target_age, width=8).grid(row=1, column=2, sticky="w")
+        ttk.Label(details, text="Target voice").grid(row=0, column=3, sticky="w")
+        ttk.Combobox(details, textvariable=self.target_gender, values=["Female", "Male", "Neutral"],
+                     state="readonly", width=14).grid(row=1, column=3, sticky="w")
+        ttk.Button(details, text="Apply preset for these ages/voices", command=self.suggest_settings).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(details, wraplength=420,
+                  text="Presets are averages. Fine-tune pitch and formant by ear while talking.").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=8, pady=(10, 0))
 
-        ttk.Button(details, text="Suggest settings from age/gender", command=self.suggest_settings).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        ttk.Label(details, text="Age/gender select approximate sound presets, not a guaranteed biological conversion.",
-                  wraplength=800).grid(row=2, column=2, columnspan=2, sticky="w", padx=8, pady=(10, 0))
-
-        controls = ttk.LabelFrame(main, text="2. Live DSP controls", padding=10)
+        controls = ttk.LabelFrame(main, text="2. Live controls", padding=10)
         controls.pack(fill="x", pady=4)
         controls.columnconfigure(1, weight=1)
-        self._slider(controls, "Pitch shift (semitones)", self.pitch, -8, 8, 0)
-        self._slider(controls, "Timbre / EQ strength", self.timbre, 0, 1, 1)
-        self._slider(controls, "Noise gate strength", self.noise_gate, 0, 1, 2)
-        self._slider(controls, "Echo amount", self.echo, 0, 0.8, 3)
-        self._slider(controls, "Robot effect amount", self.robot, 0, 1, 4)
-
-        ttk.Label(controls, text="Timbre profile").grid(row=5, column=0, sticky="w", pady=4)
-        profiles = ["Neutral", "Bright / child-like", "Feminine-style", "Masculine-style", "Elderly-style"]
-        profile_box = ttk.Combobox(controls, textvariable=self.profile, values=profiles, state="readonly", width=25)
-        profile_box.grid(row=5, column=1, sticky="w", pady=4)
+        fmt_semi = "{:+.1f} st"
+        self._slider(controls, "Pitch (semitones)", self.pitch, -12, 12, 0, fmt_semi)
+        self._slider(controls, "Formants (semitones)", self.formant, -6, 6, 1, fmt_semi)
+        self._slider(controls, "Brightness (dB/octave)", self.brightness, -4, 4, 2, "{:+.1f}")
+        self._slider(controls, "Age tremor", self.tremor, 0, 1, 3, "{:.2f}")
+        self._slider(controls, "Noise gate threshold", self.gate_db, -80, -30, 4,
+                     lambda v: "Off" if v <= -79 else f"{v:.0f} dB")
+        self._slider(controls, "Echo", self.echo, 0, 0.8, 5, "{:.2f}")
+        self._slider(controls, "Robot", self.robot, 0, 1, 6, "{:.2f}")
+        self._slider(controls, "Output volume", self.volume, 0, 1.5, 7, "{:.2f}")
         ttk.Checkbutton(controls, text="Telephone / walkie-talkie filter", variable=self.radio,
-                        command=self.sync_settings).grid(row=6, column=0, columnspan=2, sticky="w", pady=4)
+                        command=self.sync_settings).grid(row=8, column=0, columnspan=3, sticky="w", pady=4)
 
         buttons = ttk.Frame(main)
         buttons.pack(fill="x", pady=10)
-        self.start_button = ttk.Button(buttons, text="▶ Start live voice changer", command=self.start)
+        self.start_button = ttk.Button(buttons, text="▶ Start", command=self.start)
         self.start_button.pack(side="left", padx=(0, 8))
         self.stop_button = ttk.Button(buttons, text="■ Stop", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=(0, 8))
@@ -284,95 +467,104 @@ class VoiceChangerApp:
         self.record_button.pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="Save recording…", command=self.save_recording).pack(side="left")
 
-        ttk.Label(main, textvariable=self.status, wraplength=800).pack(anchor="w", pady=4)
-        ttk.Label(main, text=f"Audio format: {SAMPLE_RATE} Hz, mono, block size {BLOCK_SIZE} samples (~{1000*BLOCK_SIZE/SAMPLE_RATE:.1f} ms per block).",
-                  foreground="#555").pack(anchor="w", pady=(4, 0))
-        ttk.Label(main, text="Prototype note: the FFT pitch shifter may sound metallic; EQ is only a formant-inspired tone approximation.",
-                  wraplength=800, foreground="#555").pack(anchor="w", pady=(4, 0))
+        ttk.Label(main, textvariable=self.status, wraplength=820).pack(anchor="w", pady=4)
+        ttk.Label(main, wraplength=820, foreground="#555",
+                  text="Tip: for a male→female voice raise pitch AND formants together. "
+                       "Pitch only = chipmunk, formants only = 'big/small throat' effect.").pack(anchor="w", pady=(4, 0))
 
-        for var in [self.pitch, self.timbre, self.noise_gate, self.echo, self.robot, self.profile]:
+        for var in [self.pitch, self.formant, self.brightness, self.gate_db, self.echo,
+                    self.robot, self.tremor, self.volume]:
             var.trace_add("write", lambda *_: self.sync_settings())
 
-    def _slider(self, parent, label, variable, low, high, row):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=4)
-        scale = ttk.Scale(parent, variable=variable, from_=low, to=high, orient="horizontal")
-        scale.grid(row=row, column=1, sticky="ew", padx=10, pady=4)
-        value_label = ttk.Label(parent, width=7, textvariable=tk.StringVar(value=""))
-        value_label.grid(row=row, column=2, sticky="e")
+    def _slider(self, parent, label, variable, low, high, row, fmt):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        ttk.Scale(parent, variable=variable, from_=low, to=high, orient="horizontal").grid(
+            row=row, column=1, sticky="ew", padx=10, pady=3)
+        text = tk.StringVar()
+        ttk.Label(parent, width=9, textvariable=text, anchor="e").grid(row=row, column=2, sticky="e")
+
         def refresh(*_):
-            value_label.configure(text=f"{variable.get():.2f}")
+            v = variable.get()
+            text.set(fmt(v) if callable(fmt) else fmt.format(v))
         variable.trace_add("write", refresh)
         refresh()
 
-    def suggest_settings(self):
+    # -- presets / settings --------------------------------------------- #
+    def suggest_settings(self, announce=True):
         try:
-            current_age = int(self.current_age.get())
-            target_age = int(self.target_age.get())
+            ca, ta = int(self.current_age.get()), int(self.target_age.get())
         except (ValueError, tk.TclError):
-            messagebox.showerror("Invalid age", "Please enter valid ages from 1 to 120.")
+            messagebox.showerror("Invalid age", "Please enter valid ages.")
             return
-
-        target_gender = self.target_gender.get()
-        current_gender = self.current_gender.get()
-        if target_age <= 12:
-            profile = "Bright / child-like"
-        elif target_age >= 60:
-            profile = "Elderly-style"
-        elif target_gender == "Female":
-            profile = "Feminine-style"
-        elif target_gender == "Male":
-            profile = "Masculine-style"
-        else:
-            profile = "Neutral"
-
-        # These are intentionally mild starting guesses, not a scientific age model.
-        pitch = np.clip((target_age - current_age) / 20.0, -5.0, 5.0)
-        if target_gender in ("Female", "Male") and current_gender in ("Female", "Male") and target_gender != current_gender:
-            pitch += 2.0 if target_gender == "Female" else -2.0
-        self.profile.set(profile)
-        self.pitch.set(float(clamp(pitch, -8, 8)))
-        self.timbre.set(0.6)
+        f0_c, fs_c, _ = voice_traits(ca, self.current_gender.get())
+        f0_t, fs_t, tremor = voice_traits(ta, self.target_gender.get())
+        self.pitch.set(round(clamp(12 * math.log2(f0_t / f0_c), -12, 12), 1))
+        self.formant.set(round(clamp(12 * math.log2(fs_t / fs_c), -6, 6), 1))
+        self.tremor.set(round(tremor, 2))
+        self.brightness.set(0.0)
         self.sync_settings()
-        self.status.set("Suggested settings applied. Adjust by ear; age/gender presets are approximate.")
+        if announce:
+            self.status.set(f"Preset applied: pitch {self.pitch.get():+.1f} st, formants {self.formant.get():+.1f} st. "
+                            "Adjust by ear.")
 
     def sync_settings(self):
+        if self.processor is None:
+            return
         self.processor.update_settings(
-            pitch=float(self.pitch.get()),
-            timbre=float(self.timbre.get()),
-            noise_gate=float(self.noise_gate.get()),
-            echo=float(self.echo.get()),
-            robot=float(self.robot.get()),
-            radio=bool(self.radio.get()),
-            profile=str(self.profile.get()),
-        )
+            pitch=float(self.pitch.get()), formant=float(self.formant.get()),
+            brightness=float(self.brightness.get()), gate_db=float(self.gate_db.get()),
+            echo=float(self.echo.get()), robot=float(self.robot.get()),
+            tremor=float(self.tremor.get()), volume=float(self.volume.get()),
+            radio=bool(self.radio.get()))
+
+    # -- audio ----------------------------------------------------------- #
+    @staticmethod
+    def _dev_index(text):
+        try:
+            return int(text.split(":")[0])
+        except (ValueError, AttributeError):
+            return None
 
     def start(self):
         if self.running:
             return
+        if sd is None:
+            messagebox.showerror("Audio unavailable", f"sounddevice / PortAudio could not be loaded:\n{SD_ERROR}")
+            return
+        in_idx, out_idx = self._dev_index(self.in_dev.get()), self._dev_index(self.out_dev.get())
+        rates = []
         try:
-            self.sync_settings()
-            self.processor.input_history.fill(0)
-            self.processor.output_overlap.fill(0)
-            self.processor.norm_overlap.fill(0)
-            self.processor.delay_line.fill(0)
-            self.processor.delay_pos = 0
-            self.stream = sd.Stream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SIZE,
-                channels=(CHANNELS, CHANNELS),
-                dtype="float32",
-                callback=self.audio_callback,
-                latency="low",
-            )
-            self.stream.start()
-            self.running = True
-            self.start_button.configure(state="disabled")
-            self.stop_button.configure(state="normal")
-            self.status.set("LIVE — speak into the selected microphone. Keep output volume low.")
-        except Exception as exc:
-            self.stream = None
-            messagebox.showerror("Could not start audio", f"{exc}\n\nCheck your microphone/speaker permissions and audio devices.")
-            self.status.set("Could not start. Check the selected audio devices.")
+            for idx, kind in ((in_idx, "input"), (out_idx, "output")):
+                if idx is not None:
+                    rates.append(int(sd.query_devices(idx)["default_samplerate"]))
+            out_ch = 2 if sd.query_devices(out_idx)["max_output_channels"] >= 2 else 1
+        except Exception:
+            out_ch = 1
+        rates += [48000, 44100]
+        rates = list(dict.fromkeys(rates))
+
+        last_error = None
+        for sr in rates:
+            try:
+                self.processor = LiveDSP(sr)
+                self.sync_settings()
+                self.stream = sd.Stream(samplerate=sr, blocksize=HOP, device=(in_idx, out_idx),
+                                        channels=(1, out_ch), dtype="float32",
+                                        latency="low", callback=self.audio_callback)
+                self.stream.start()
+                self.sample_rate = sr
+                self.running = True
+                latency_ms = 1000.0 * (FFT_SIZE + HOP) / sr
+                self.start_button.configure(state="disabled")
+                self.stop_button.configure(state="normal")
+                self.status.set(f"LIVE at {sr} Hz (~{latency_ms:.0f} ms processing delay). Keep volume low.")
+                return
+            except Exception as exc:
+                last_error = exc
+                self.stream = None
+        messagebox.showerror("Could not start audio",
+                             f"{last_error}\n\nTry other input/output devices (same host API, e.g. both WASAPI).")
+        self.status.set("Could not start. Check the selected audio devices.")
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
         if status:
@@ -381,16 +573,10 @@ class VoiceChangerApp:
             except queue.Full:
                 pass
         try:
-            if indata.shape[1] != CHANNELS:
-                block = np.mean(indata, axis=1, keepdims=True)
-            else:
-                block = indata
-            processed = self.processor._process_block(block)
-            if processed.shape[0] != frames:
-                processed = processed[:frames]
-                if len(processed) < frames:
-                    processed = np.pad(processed, ((0, frames-len(processed)), (0, 0)))
-            outdata[:] = processed
+            out = self.processor.process(indata[:, 0])
+            if len(out) < frames:
+                out = np.pad(out, (0, frames - len(out)))
+            outdata[:] = out[:frames, None]
         except Exception as exc:
             outdata.fill(0)
             try:
@@ -412,6 +598,9 @@ class VoiceChangerApp:
         self.status.set("Stopped.")
 
     def toggle_recording(self):
+        if self.processor is None:
+            messagebox.showinfo("Not running", "Click Start first, then record.")
+            return
         with self.processor.recording_lock:
             if not self.processor.recording:
                 self.processor.recorded_chunks = []
@@ -424,21 +613,20 @@ class VoiceChangerApp:
                 self.status.set("Recording stopped. Click Save recording to export a WAV file.")
 
     def save_recording(self):
+        if self.processor is None or sf is None:
+            messagebox.showinfo("Unavailable", "Nothing recorded yet (or soundfile is not installed).")
+            return
         with self.processor.recording_lock:
             chunks = list(self.processor.recorded_chunks)
         if not chunks:
             messagebox.showinfo("No recording", "Start recording output and speak first.")
             return
-        data = np.concatenate(chunks, axis=0)
         filename = filedialog.asksaveasfilename(
-            title="Save transformed voice",
-            defaultextension=".wav",
-            filetypes=[("WAV audio", "*.wav")],
-            initialfile="live_transformed_voice.wav",
-        )
+            title="Save transformed voice", defaultextension=".wav",
+            filetypes=[("WAV audio", "*.wav")], initialfile="live_transformed_voice.wav")
         if filename:
             try:
-                sf.write(filename, data, SAMPLE_RATE)
+                sf.write(filename, np.concatenate(chunks), self.sample_rate)
                 self.status.set(f"Saved transformed audio to {filename}")
             except Exception as exc:
                 messagebox.showerror("Save failed", str(exc))
@@ -461,7 +649,7 @@ class VoiceChangerApp:
 
 def main():
     root = tk.Tk()
-    app = VoiceChangerApp(root)
+    VoiceChangerApp(root)
     root.mainloop()
 
 
